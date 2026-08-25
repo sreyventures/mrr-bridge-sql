@@ -1,62 +1,52 @@
 -- ============================================================================
--- mrr-foundation — demo.sql
+-- MRR Bridge SQL - demo.sql
 --
--- A complete, self-contained MRR foundation: subscriptions in, monthly MRR
--- bridge out. Synthetic data is inlined below, so you can paste this whole
--- file into a BigQuery console and run it. No setup, no credentials, no tables.
+-- Self-contained BigQuery Standard SQL for subscription MRR movements and a
+-- reconciled monthly bridge. Synthetic Stripe-shaped data is inlined below.
 --
--- What it builds, in order:
---   1. raw_subscriptions      synthetic Stripe-shaped subscription rows
---   2. customer_month_mrr     one row per customer per month  <- the spine
---   3. mrr_movement           new / expansion / contraction / churn / reactivation
---   4. mrr_summary            the monthly bridge (the output below)
---
--- Every judgment call lives in the POLICY block. Nothing after it encodes an
--- opinion. Search this file for "OPINION:" to see the complete list.
+-- Run this file as-is in BigQuery. Replace raw_subscriptions with your source
+-- relation when adapting it to a warehouse.
 -- ============================================================================
-
 WITH
 
--- ─── POLICY ─────────────────────────────────────────────────────────────────
--- Change these, re-run, the bridge still balances.
+-- Configuration used by every downstream model.
 policy AS (
   SELECT
-    0.01  AS materiality_threshold,   -- OPINION: |change| below this is no_change, not expansion/contraction
-    2     AS rounding_dp,             -- OPINION: round before comparing, so float dust never becomes "movement"
-    TRUE  AS absent_month_means_zero  -- OPINION: a customer-month with no subscription = 0 MRR (not unknown)
+    DATE '2026-05-31' AS as_of_date,
+    0.01 AS materiality_threshold,
+    2 AS rounding_dp
 ),
 
--- ─── 1. RAW INPUT (synthetic) ───────────────────────────────────────────────
--- Shaped like a Stripe subscription-items export. Replace this CTE with your
--- own source and everything downstream still works.
---   ended_at NULL = still active
+-- Synthetic input. Amounts are in cents; dates are inclusive by month.
 raw_subscriptions AS (
-  SELECT * FROM UNNEST([
-    STRUCT<subscription_id STRING, customer_id STRING, unit_amount_cents INT64,
-           billing_interval STRING, quantity INT64, started_at DATE, ended_at DATE>
-    -- steady customer: new, then flat
-    ('sub_001', 'cus_apex',    50000, 'month', 1, DATE '2026-01-15', NULL),
-    -- upgrade mid-life: new, then expansion
-    ('sub_002', 'cus_borealis',20000, 'month', 1, DATE '2026-02-03', DATE '2026-03-31'),
-    ('sub_003', 'cus_borealis',35000, 'month', 1, DATE '2026-04-01', NULL),
-    -- downgrade: new, then contraction
-    ('sub_004', 'cus_cedar',   80000, 'month', 1, DATE '2026-01-08', DATE '2026-02-28'),
-    ('sub_005', 'cus_cedar',   45000, 'month', 1, DATE '2026-03-01', NULL),
-    -- churn: leaves in March, never returns
-    ('sub_006', 'cus_dune',    30000, 'month', 1, DATE '2026-01-20', DATE '2026-03-31'),
-    -- win-back: churns in Feb, returns in May => reactivation
-    ('sub_007', 'cus_ember',   25000, 'month', 1, DATE '2026-01-05', DATE '2026-02-28'),
-    ('sub_008', 'cus_ember',   25000, 'month', 1, DATE '2026-05-01', NULL),
-    -- annual plan: proves interval normalization (120000/yr = 10000/mo)
-    ('sub_009', 'cus_frost',  1200000,'year',  1, DATE '2026-02-10', NULL),
-    -- seat expansion via quantity, not price
-    ('sub_010', 'cus_glade',   10000, 'month', 3, DATE '2026-01-12', DATE '2026-04-30'),
-    ('sub_011', 'cus_glade',   10000, 'month', 7, DATE '2026-05-01', NULL)
+  SELECT *
+  FROM UNNEST([
+    STRUCT<subscription_id STRING, customer_id STRING, unit_amount_cents INT64, billing_interval STRING, quantity INT64, started_at DATE, ended_at DATE>
+      ('sub_new', 'cus_new', 10000, 'month', 1, DATE '2026-01-05', NULL),
+    STRUCT<subscription_id STRING, customer_id STRING, unit_amount_cents INT64, billing_interval STRING, quantity INT64, started_at DATE, ended_at DATE>
+      ('sub_expand_base', 'cus_expand', 20000, 'month', 1, DATE '2026-01-05', NULL),
+    STRUCT<subscription_id STRING, customer_id STRING, unit_amount_cents INT64, billing_interval STRING, quantity INT64, started_at DATE, ended_at DATE>
+      ('sub_expand_addon', 'cus_expand', 10000, 'month', 1, DATE '2026-03-05', NULL),
+    STRUCT<subscription_id STRING, customer_id STRING, unit_amount_cents INT64, billing_interval STRING, quantity INT64, started_at DATE, ended_at DATE>
+      ('sub_contract_old', 'cus_contract', 40000, 'month', 1, DATE '2026-01-05', DATE '2026-02-28'),
+    STRUCT<subscription_id STRING, customer_id STRING, unit_amount_cents INT64, billing_interval STRING, quantity INT64, started_at DATE, ended_at DATE>
+      ('sub_contract_new', 'cus_contract', 25000, 'month', 1, DATE '2026-03-01', NULL),
+    STRUCT<subscription_id STRING, customer_id STRING, unit_amount_cents INT64, billing_interval STRING, quantity INT64, started_at DATE, ended_at DATE>
+      ('sub_churn', 'cus_churn', 30000, 'month', 1, DATE '2026-01-05', DATE '2026-03-31'),
+    STRUCT<subscription_id STRING, customer_id STRING, unit_amount_cents INT64, billing_interval STRING, quantity INT64, started_at DATE, ended_at DATE>
+      ('sub_reactivate_first', 'cus_reactivate', 25000, 'month', 1, DATE '2026-01-05', DATE '2026-02-28'),
+    STRUCT<subscription_id STRING, customer_id STRING, unit_amount_cents INT64, billing_interval STRING, quantity INT64, started_at DATE, ended_at DATE>
+      ('sub_reactivate_return', 'cus_reactivate', 25000, 'month', 1, DATE '2026-04-01', NULL),
+    STRUCT<subscription_id STRING, customer_id STRING, unit_amount_cents INT64, billing_interval STRING, quantity INT64, started_at DATE, ended_at DATE>
+      ('sub_annual', 'cus_annual', 1200000, 'year', 1, DATE '2026-01-10', NULL),
+    STRUCT<subscription_id STRING, customer_id STRING, unit_amount_cents INT64, billing_interval STRING, quantity INT64, started_at DATE, ended_at DATE>
+      ('sub_seats_old', 'cus_seats', 5000, 'month', 3, DATE '2026-01-05', DATE '2026-02-28'),
+    STRUCT<subscription_id STRING, customer_id STRING, unit_amount_cents INT64, billing_interval STRING, quantity INT64, started_at DATE, ended_at DATE>
+      ('sub_seats_new', 'cus_seats', 5000, 'month', 7, DATE '2026-03-01', NULL)
   ])
 ),
 
--- ─── 2. NORMALIZE TO MONTHLY MRR ────────────────────────────────────────────
--- Annual/quarterly plans are divided down to a monthly figure. Cents -> currency.
+-- Normalize recurring amounts to monthly MRR.
 subscription_mrr AS (
   SELECT
     subscription_id,
@@ -65,63 +55,69 @@ subscription_mrr AS (
     ended_at,
     ROUND(
       (unit_amount_cents * quantity / 100.0)
-      / CASE billing_interval           -- OPINION: annual plans are spread evenly,
-          WHEN 'year'    THEN 12        -- not recognized in the month they are billed
-          WHEN 'quarter' THEN 3
-          ELSE 1
-        END
-    , 2) AS monthly_mrr
+        / CASE billing_interval
+            WHEN 'year' THEN 12
+            WHEN 'quarter' THEN 3
+            ELSE 1
+          END,
+      (SELECT rounding_dp FROM policy)
+    ) AS monthly_mrr
   FROM raw_subscriptions
 ),
 
--- Month spine: every month the dataset spans.
+-- One row per month in the configured reporting window.
 months AS (
   SELECT month
   FROM UNNEST(GENERATE_DATE_ARRAY(
-    (SELECT DATE_TRUNC(MIN(started_at), MONTH) FROM subscription_mrr),
-    (SELECT DATE_TRUNC(MAX(COALESCE(ended_at, CURRENT_DATE())), MONTH) FROM subscription_mrr),
+    DATE_TRUNC((SELECT MIN(started_at) FROM subscription_mrr), MONTH),
+    DATE_TRUNC((SELECT as_of_date FROM policy), MONTH),
     INTERVAL 1 MONTH
   )) AS month
 ),
 
--- Every customer x every month, so a drop to zero is an explicit row we can see.
--- Without this, churn is the *absence* of a row and becomes invisible.
+-- The complete customer-month spine makes churn an explicit zero-MRR row.
 customer_months AS (
   SELECT c.customer_id, m.month
-  FROM (SELECT DISTINCT customer_id FROM subscription_mrr) c
-  CROSS JOIN months m
+  FROM (SELECT DISTINCT customer_id FROM subscription_mrr) AS c
+  CROSS JOIN months AS m
 ),
 
--- ─── 3. customer_month_mrr — THE SPINE ──────────────────────────────────────
+-- Customer-month MRR.
 customer_month_mrr AS (
   SELECT
     cm.customer_id,
     cm.month,
-    ROUND(COALESCE(SUM(s.monthly_mrr), 0), (SELECT rounding_dp FROM policy)) AS mrr
-  FROM customer_months cm
-  LEFT JOIN subscription_mrr s
-    ON  s.customer_id = cm.customer_id
-    -- a subscription counts for a month if it was active at any point in it
+    ROUND(
+      COALESCE(SUM(s.monthly_mrr), 0),
+      (SELECT rounding_dp FROM policy)
+    ) AS mrr
+  FROM customer_months AS cm
+  LEFT JOIN subscription_mrr AS s
+    ON s.customer_id = cm.customer_id
     AND DATE_TRUNC(s.started_at, MONTH) <= cm.month
-    AND cm.month <= DATE_TRUNC(COALESCE(s.ended_at, CURRENT_DATE()), MONTH)
+    AND cm.month <= DATE_TRUNC(COALESCE(s.ended_at, (SELECT as_of_date FROM policy)), MONTH)
   GROUP BY cm.customer_id, cm.month
 ),
 
--- ─── 4. mrr_movement — THE STATE MACHINE ────────────────────────────────────
+-- Compare each customer-month with its previous state.
 with_prior AS (
   SELECT
     customer_id,
     month,
     mrr,
     COALESCE(LAG(mrr) OVER (PARTITION BY customer_id ORDER BY month), 0) AS prior_mrr,
-    -- has this customer ever had MRR before this month? distinguishes new vs reactivation
     COALESCE(
-      MAX(CASE WHEN mrr > 0 THEN 1 ELSE 0 END)
-        OVER (PARTITION BY customer_id ORDER BY month
-              ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), 0) AS had_mrr_before
+      MAX(CASE WHEN mrr > 0 THEN 1 ELSE 0 END) OVER (
+        PARTITION BY customer_id
+        ORDER BY month
+        ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+      ),
+      0
+    ) AS had_mrr_before
   FROM customer_month_mrr
 ),
 
+-- Classify the movement and calculate its signed MRR change.
 mrr_movement AS (
   SELECT
     w.customer_id,
@@ -132,44 +128,48 @@ mrr_movement AS (
     CASE
       WHEN w.mrr > 0 AND w.prior_mrr = 0 AND w.had_mrr_before = 0 THEN 'new'
       WHEN w.mrr > 0 AND w.prior_mrr = 0 AND w.had_mrr_before = 1 THEN 'reactivation'
-      WHEN w.mrr = 0 AND w.prior_mrr > 0                          THEN 'churn'
-      WHEN w.mrr = 0 AND w.prior_mrr = 0                          THEN 'inactive'
-      WHEN ABS(w.mrr - w.prior_mrr) < p.materiality_threshold     THEN 'no_change'
-      WHEN w.mrr > w.prior_mrr                                    THEN 'expansion'
-      ELSE                                                             'contraction'
+      WHEN w.mrr = 0 AND w.prior_mrr > 0 THEN 'churn'
+      WHEN w.mrr = 0 AND w.prior_mrr = 0 THEN 'inactive'
+      WHEN ABS(w.mrr - w.prior_mrr) < p.materiality_threshold THEN 'no_change'
+      WHEN w.mrr > w.prior_mrr THEN 'expansion'
+      ELSE 'contraction'
     END AS movement_class
-  FROM with_prior w
-  CROSS JOIN policy p
+  FROM with_prior AS w
+  CROSS JOIN policy AS p
 ),
 
--- ─── 5. mrr_summary — THE BRIDGE ────────────────────────────────────────────
+-- Aggregate customer movements into the monthly bridge.
 bridge AS (
   SELECT
     month,
-    ROUND(SUM(prior_mrr), 2)                                                  AS opening_mrr,
-    ROUND(SUM(IF(movement_class = 'new',          mrr, 0)), 2)                AS new_mrr,
-    ROUND(SUM(IF(movement_class = 'reactivation', mrr, 0)), 2)                AS reactivation_mrr,
-    ROUND(SUM(IF(movement_class = 'expansion',    mrr_change, 0)), 2)         AS expansion_mrr,
-    ROUND(SUM(IF(movement_class = 'contraction',  mrr_change, 0)), 2)         AS contraction_mrr,
-    ROUND(SUM(IF(movement_class = 'churn',       -prior_mrr, 0)), 2)          AS churn_mrr,
-    ROUND(SUM(mrr), 2)                                                        AS closing_mrr
+    ROUND(SUM(prior_mrr), (SELECT rounding_dp FROM policy)) AS opening_mrr,
+    ROUND(SUM(IF(movement_class = 'new', mrr, 0)), (SELECT rounding_dp FROM policy)) AS new_mrr,
+    ROUND(SUM(IF(movement_class = 'reactivation', mrr, 0)), (SELECT rounding_dp FROM policy)) AS reactivation_mrr,
+    ROUND(SUM(IF(movement_class = 'expansion', mrr_change, 0)), (SELECT rounding_dp FROM policy)) AS expansion_mrr,
+    ROUND(SUM(IF(movement_class = 'contraction', mrr_change, 0)), (SELECT rounding_dp FROM policy)) AS contraction_mrr,
+    ROUND(SUM(IF(movement_class = 'churn', -prior_mrr, 0)), (SELECT rounding_dp FROM policy)) AS churn_mrr,
+    ROUND(SUM(mrr), (SELECT rounding_dp FROM policy)) AS closing_mrr
   FROM mrr_movement
   GROUP BY month
-)
+),
 
--- ─── OUTPUT ─────────────────────────────────────────────────────────────────
--- reconciles = TRUE means opening + all movements = closing, exactly.
--- If this is ever FALSE, the model is wrong. That is the whole point.
-SELECT
-  FORMAT_DATE('%Y-%m', month) AS month,
-  opening_mrr,
-  new_mrr,
-  expansion_mrr,
-  contraction_mrr,
-  churn_mrr,
-  reactivation_mrr,
-  closing_mrr,
-  ROUND(opening_mrr + new_mrr + expansion_mrr + contraction_mrr
-        + churn_mrr + reactivation_mrr, 2) = closing_mrr AS reconciles
-FROM bridge
-ORDER BY month
+-- Final output. TRUE means the bridge reconciles exactly at the configured precision.
+mrr_summary AS (
+  SELECT
+    FORMAT_DATE('%Y-%m', month) AS month,
+    opening_mrr,
+    new_mrr,
+    expansion_mrr,
+    contraction_mrr,
+    churn_mrr,
+    reactivation_mrr,
+    closing_mrr,
+    ROUND(
+      opening_mrr + new_mrr + expansion_mrr + contraction_mrr + churn_mrr + reactivation_mrr,
+      (SELECT rounding_dp FROM policy)
+    ) = closing_mrr AS reconciles
+  FROM bridge
+)
+SELECT *
+FROM mrr_summary
+ORDER BY month;
