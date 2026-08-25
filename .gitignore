@@ -1,0 +1,29 @@
+# Secrets / local
+.env
+*.env
+.env.*
+*.key
+*.json.cred
+
+# Python
+__pycache__/
+.venv/
+venv/
+*.pyc
+
+# Node
+node_modules/
+
+# dbt
+target/
+dbt_packages/
+logs/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Claude local state
+.claude/
