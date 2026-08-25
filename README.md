@@ -1,73 +1,86 @@
-# mrr-foundation
+# MRR Bridge SQL
 
-**MRR, movement, and retention from your subscription data — as tables you own, not a dashboard you rent.**
+BigQuery SQL for transforming subscription data into customer-level MRR movements and a reconciled monthly bridge.
 
-You have subscriptions in Stripe. You need monthly MRR per customer, a movement
-breakdown (new / expansion / contraction / churn / reactivation), and a bridge that
-explains why revenue changed. Building that yourself is a few weeks of edge cases.
-This is that foundation, pre-built.
+## Who this is for
 
-## Try it in 30 seconds
+This project is for data and analytics engineers building revenue models for subscription businesses.
 
-Copy [`demo.sql`](demo.sql) into a BigQuery console and run it. Synthetic data is
-inlined — no tables, no credentials, no setup. It processes 0 bytes.
+It assumes an existing SQL warehouse and subscription data from Stripe or a similar billing source. The demo uses synthetic, Stripe-shaped data; adapt the input relation to your warehouse schema.
 
-| Month | Opening | New | Expansion | Contraction | Churn | Reactivation | Closing |
-|---|---|---|---|---|---|---|---|
-| 2026-01 | 0 | 2,150 | 0 | 0 | 0 | 0 | 2,150 |
-| 2026-02 | 2,150 | 1,200 | 0 | 0 | 0 | 0 | 3,350 |
-| 2026-03 | 3,350 | 0 | 0 | -350 | -250 | 0 | 2,750 |
-| 2026-04 | 2,750 | 0 | 150 | 0 | -300 | 0 | 2,600 |
-| 2026-05 | 2,600 | 0 | 400 | 0 | 0 | 250 | 3,250 |
+## What it produces
 
-Every row balances: `opening + new + expansion + contraction + churn + reactivation = closing`.
+- Customer-month MRR
+- Per-customer MRR movement classifications
+- A monthly MRR bridge
+- A reconciliation check
 
-The synthetic data deliberately includes the three cases most hand-rolled models get wrong:
+Movement classifications include New Business, Expansion, Contraction, Churn, Reactivation, and Unchanged.
 
-- **Annual plans** — a $12,000/yr subscription contributes $1,000/mo, not a one-month spike.
-- **Reactivation vs. new** — a customer who churns and returns is `reactivation`, not `new`.
-- **Seat changes** — 3 → 7 seats at the same unit price is `expansion`, not a new subscription.
+## Quick start
 
-## The opinions
+1. Open BigQuery.
+2. Copy [`demo.sql`](demo.sql) into a query.
+3. Run it.
+4. Confirm that the output `reconciles` column is `TRUE`.
 
-Every judgment call lives in one `policy` block at the top of the model. Nothing below
-it encodes an opinion. To see the complete list:
+The demo data is inlined. It requires no source tables, credentials, or setup, and processes zero source bytes.
 
-```bash
-grep -rn "OPINION:" .
-```
+## Input relation
 
-Current defaults: annual plans spread evenly across 12 months; a customer-month with no
-subscription counts as 0 MRR (so churn is a visible row, not an absent one); changes below
-$0.01 are `no_change`; amounts round to 2dp before comparison so float dust never becomes
-"movement".
+The query expects subscription records with these fields:
+
+| Field | Description |
+|---|---|
+| `customer_id` | Stable customer identifier |
+| `subscription_id` | Stable subscription identifier |
+| `started_at` | Subscription start date |
+| `ended_at` | Subscription end date, if ended |
+| `unit_amount` | Recurring price per unit in the source currency |
+| `quantity` | Quantity or seat count |
+| `interval` | Billing interval, currently `month` or `year` |
+
+Replace the demo `subscriptions` CTE with a relation from your warehouse. The query is written for BigQuery Standard SQL.
+
+## Output models
+
+The query builds these models as CTEs and returns `mrr_summary` as its final result:
+
+- `customer_month_mrr`: one row per customer and month, including zero-MRR months needed to show churn.
+- `mrr_movement`: one row per customer and month with the movement classification and amount.
+- `mrr_summary`: the monthly bridge from opening MRR to closing MRR, including the reconciliation check.
+
+## Metric definitions
+
+- Monthly MRR is the recurring subscription amount normalized to a monthly value. Annual plans are divided by 12.
+- New Business is the first positive MRR for a customer.
+- Expansion is an increase from one positive customer-month to the next.
+- Contraction is a decrease while the customer remains active.
+- Churn is a change from positive MRR to zero.
+- Reactivation is a return to positive MRR after a prior churn.
+- Unchanged is a movement below the configured materiality threshold.
+
+## Policy decisions
+
+Assumptions are grouped in the `policy` CTE at the top of `demo.sql`. The current defaults are:
+
+- A customer-month without active subscription MRR is treated as zero.
+- Changes below `0.01` are treated as no change.
+- Amounts are rounded to two decimal places before comparison.
+- The demo uses an explicit as-of date so its result is reproducible.
+
+Review these decisions before adapting the query to production data.
+
+## Scope and limitations
+
+This is a SQL starting point, not a complete Stripe connector or dbt package. It does not fetch data from Stripe, define a warehouse ingestion process, or cover every billing configuration.
+
+Before production use, validate the model against your subscription schema and business rules, including trials, discounts, taxes, credits, refunds, multiple subscription items, currency handling, backdated changes, pauses, and cancellations.
 
 ## Status
 
-Early. `demo.sql` is complete and verified end-to-end.
-
-Roadmap:
-
-- [x] `demo.sql` — self-contained, runnable, reconciles
-- [ ] Split models: `stg_stripe__*`, `customer_month_mrr`, `mrr_movement`, `mrr_summary`
-- [ ] Read a real Stripe replica (Fivetran / Airbyte schemas) instead of inlined data
-- [ ] `customer_bridge` — match Stripe customers to your production database
-      (override seed > Stripe metadata key > normalized email)
-- [ ] `customer_bridge_exceptions` — who didn't match, who is active but unbilled,
-      who is billed but churned
-- [ ] Edge-case fixtures as proper tests + CI
-- [ ] `DECISIONLOG.md` — documented judgment calls, including subscription-based vs.
-      invoice-based MRR (this package uses subscription-based: it sees churn cleanly,
-      where invoice-based cannot, since absence of an invoice is not an event)
-
-## Design notes
-
-- **Input contract:** the model needs one row per customer per month with an MRR
-  amount. `demo.sql` derives that from subscription rows; a real source does the same.
-- **Single currency.** Multi-currency normalization is deliberately out of scope.
-- **Deterministic matching only** for the customer bridge. Ambiguous cases get
-  reported, not guessed.
+Early release. The self-contained demo is runnable and includes a reconciliation check. Split warehouse models, real Stripe-replica inputs, and broader test coverage are planned.
 
 ## License
 
-Apache-2.0
+Apache-2.0. See [`LICENSE`](LICENSE).
