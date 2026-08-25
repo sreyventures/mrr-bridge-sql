@@ -2,6 +2,8 @@
 
 BigQuery SQL for transforming subscription data into customer-level MRR movements and a reconciled monthly bridge.
 
+For a short explanation of the model and its scope, see the [MRR Bridge SQL resource on MRRWorks](https://mrrworks.com/resources/mrr-bridge-sql/).
+
 ## Who this is for
 
 This project is for data and analytics engineers building revenue models for subscription businesses.
